@@ -68,8 +68,7 @@ export class BrowserHtmlStorage implements Storage {
 	static async open(name: string, session: string, owner?: string): Promise<BrowserHtmlStorage> {
 		const storage = new BrowserHtmlStorage(name, session, owner);
 		let opened: { size: number; bytes: Uint8Array } | undefined;
-		try {
-			const res = (await storage.call({ kind: "open", name })) as { size: number; bytes: Uint8Array; error?: string };
+		const res = (await storage.call({ kind: "open", name })) as { size: number; bytes: Uint8Array; error?: string };
 		if (res.error) {
 			// A second holder means another tab writes; hand Explorer its TakenError shape.
 			const err = new Error(res.error) as Error & { name: string };
@@ -77,8 +76,7 @@ export class BrowserHtmlStorage implements Storage {
 			throw err;
 		}
 		opened = res;
-		if (opened && opened.error) throw new Error(opened.error);
-		const bytes = opened?.bytes ?? new Uint8Array();
+		const bytes = opened.bytes ?? new Uint8Array();
 		// A torn tail is dropped from memory; the worker still holds the file bytes for appends.
 		const read = readMembers(bytes, pako_inflate_raw);
 		if (read.incomplete_bytes > 0 && read.valid_bytes > 0) {
