@@ -1,0 +1,336 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>HtmlStorage browser checks</title>
+</head>
+<body>
+<main>
+<h1>HtmlStorage browser checks</h1>
+<output id="out"></output>
+</main>
+<script type="module">
+// Check 8: what the browser gives HtmlStorage. Each check returns plain data.
+const enc = new TextEncoder();
+const dec = new TextDecoder();
+
+const pipe = async (bytes, stream) =>
+	new Uint8Array(await new Response(new Blob([bytes]).stream().pipeThrough(stream)).arrayBuffer());
+const gzip = (text) => pipe(enc.encode(text), new CompressionStream("gzip"));
+const gunzip = (bytes) => pipe(bytes, new DecompressionStream("gzip"));
+const concat = (...parts) => {
+	const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+	let at = 0;
+	for (const p of parts) (out.set(p, at), (at += p.length));
+	return out;
+};
+const dir = () => navigator.storage.getDirectory();
+const fileBytes = async (name) => new Uint8Array(await (await (await (await dir()).getFileHandle(name)).getFile()).arrayBuffer());
+const appendWritable = async (name, bytes) => {
+	const handle = await (await dir()).getFileHandle(name, { create: true });
+	const size = (await handle.getFile()).size;
+	const w = await handle.createWritable({ keepExistingData: true });
+	await w.seek(size);
+	await w.write(bytes);
+	await w.close();
+};
+
+// RFC 1952 FEXTRA subfield "RL" holding the member's total length (uint32 LE).
+// Readers that do not know it skip it; ours walks members by it.
+const withLength = (member) => {
+	if (member[0] !== 0x1f || member[1] !== 0x8b || member[3] !== 0) throw new Error("expected a plain gzip header");
+	const extra = 2 + 4 + 4; // XLEN, SI1 SI2 LEN, value
+	const out = new Uint8Array(member.length + extra);
+	out.set(member.subarray(0, 10));
+	out[3] = 0x04; // FEXTRA
+	const view = new DataView(out.buffer);
+	view.setUint16(10, 8, true); // XLEN
+	out[12] = 0x52; out[13] = 0x4c; // "RL"
+	view.setUint16(14, 4, true);
+	view.setUint32(16, out.length, true);
+	out.set(member.subarray(10), 20);
+	return out;
+};
+/** Walk members by their RL length; a short last member is an unfinished tail. */
+const readMembers = async (bytes) => {
+	const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+	const texts = [];
+	let at = 0;
+	while (at < bytes.length) {
+		if (bytes.length - at < 20) break;
+		if (bytes[at] !== 0x1f || bytes[at + 1] !== 0x8b || bytes[at + 3] !== 0x04 || bytes[at + 12] !== 0x52 || bytes[at + 13] !== 0x4c)
+			throw new Error(`bad member header at ${at}`);
+		const length = view.getUint32(at + 16, true);
+		if (at + length > bytes.length) break;
+		texts.push(dec.decode(await gunzip(bytes.subarray(at, at + length))));
+		at += length;
+	}
+	return { text: texts.join(""), valid: at, incomplete: bytes.length - at };
+};
+window.withLength = withLength;
+
+const checks = {
+	async env() {
+		return {
+			ua: navigator.userAgent,
+			secure: isSecureContext,
+			opfs: !!navigator.storage?.getDirectory,
+			locks: !!navigator.locks,
+			compression: typeof CompressionStream === "function",
+			createWritable: "createWritable" in FileSystemFileHandle.prototype,
+			syncHandle: "createSyncAccessHandle" in FileSystemFileHandle.prototype,
+		};
+	},
+
+	// A. Concatenated gzip members decode as one stream?
+	async multiMember() {
+		const a = await gzip("<article>a</article>\n");
+		const b = await gzip("<article>b</article>\n");
+		let whole;
+		try {
+			whole = dec.decode(await gunzip(concat(a, b)));
+		} catch (e) {
+			whole = `error: ${e.name} ${e.message}`;
+		}
+		let cut;
+		try {
+			cut = dec.decode(await gunzip(concat(a, b.subarray(0, b.length - 5))));
+		} catch (e) {
+			cut = `error: ${e.name} ${e.message}`;
+		}
+		return { memberBytes: [a.length, b.length], whole, cutTail: cut };
+	},
+
+	// A2. Length-framed members: decode one by one, find a cut tail, stay valid gzip.
+	async framed() {
+		const a = withLength(await gzip("<article>a</article>\n"));
+		const b = withLength(await gzip("<article>b</article>\n"));
+		const whole = await readMembers(concat(a, b));
+		const results = [];
+		for (let cut = a.length + 1; cut < a.length + b.length; cut++) {
+			const r = await readMembers(concat(a, b).subarray(0, cut));
+			results.push(r.valid === a.length && r.text === "<article>a</article>\n");
+		}
+		let damaged;
+		try {
+			const bad = concat(a, b);
+			bad[a.length + 25] ^= 0xff;
+			await readMembers(bad);
+			damaged = "read without error";
+		} catch (e) {
+			damaged = `error: ${e.name}`;
+		}
+		const single = dec.decode(await gunzip(a));
+		const file = btoa(String.fromCharCode(...concat(a, b)));
+		return { whole: whole.text, cutsAllRecovered: results.every(Boolean), cuts: results.length, damaged, singleMemberDecodes: single, file };
+	},
+
+	// B. Append members with createWritable, truncate, read back.
+	async appendTruncate() {
+		const name = "append.html.gz";
+		await (await dir()).removeEntry(name).catch(() => {});
+		const members = [];
+		for (const text of ["<h>header</h>\n", "<c>one</c>\n", "<c>two</c>\n"]) {
+			const m = withLength(await gzip(text));
+			members.push(m.length);
+			await appendWritable(name, m);
+		}
+		const full = await fileBytes("pako.html.gz");
+		const handle = await (await dir()).getFileHandle(name);
+		const w = await handle.createWritable({ keepExistingData: true });
+		await w.truncate(full.length - members[2]);
+		await w.close();
+		const cut = await fileBytes(name);
+		return { members, full: full.length, afterTruncate: cut.length, text: (await readMembers(cut)).text };
+	},
+
+	// C. An aborted writable leaves the file as it was (writes land on close).
+	async abortedWrite() {
+		const name = "abort.html.gz";
+		await (await dir()).removeEntry(name).catch(() => {});
+		await appendWritable(name, await gzip("<c>kept</c>\n"));
+		const before = (await fileBytes(name)).length;
+		const handle = await (await dir()).getFileHandle(name);
+		const w = await handle.createWritable({ keepExistingData: true });
+		await w.seek(before);
+		await w.write(await gzip("<c>lost</c>\n"));
+		await w.abort();
+		const after = await fileBytes(name);
+		return { before, after: after.length, text: dec.decode(await gunzip(after)) };
+	},
+
+	// D. Leave a writable open across a reload; check after.
+	async startTornWrite() {
+		const name = "torn.html.gz";
+		await (await dir()).removeEntry(name).catch(() => {});
+		await appendWritable(name, withLength(await gzip("<c>kept</c>\n")));
+		const handle = await (await dir()).getFileHandle(name);
+		const w = await handle.createWritable({ keepExistingData: true });
+		await w.seek((await handle.getFile()).size);
+		await w.write(withLength(await gzip(`<c>${"x".repeat(100000)}</c>\n`)));
+		window.__torn = w; // never closed
+		return { started: true, size: (await handle.getFile()).size };
+	},
+	async readTornWrite() {
+		const bytes = await fileBytes("torn.html.gz");
+		const names = [];
+		for await (const key of (await dir()).keys()) names.push(key);
+		const r = await readMembers(bytes);
+		return { size: bytes.length, text: r.text.slice(0, 40), incomplete: r.incomplete, entries: names };
+	},
+
+	// E. Web Locks: hold, or try without waiting.
+	async holdLock() {
+		navigator.locks.request("explorer.html.gz", () => new Promise(() => {}));
+		await new Promise((r) => setTimeout(r, 50));
+		return (await navigator.locks.query()).held.map((l) => l.name);
+	},
+	async tryLock() {
+		return navigator.locks.request("explorer.html.gz", { ifAvailable: true }, (lock) => (lock ? "got it" : "held elsewhere"));
+	},
+
+	// F. A sync access handle in a worker: in-place write, flush, truncate, exclusivity.
+	async syncHandle() {
+		const src = `
+			onmessage = async () => {
+				const dir = await navigator.storage.getDirectory();
+				const h = await dir.getFileHandle("sync.html.gz", { create: true });
+				const a = await h.createSyncAccessHandle();
+				a.truncate(0);
+				a.write(new TextEncoder().encode("0123456789"), { at: 0 });
+				a.write(new TextEncoder().encode("AB"), { at: a.getSize() });
+				a.flush();
+				const size1 = a.getSize();
+				a.truncate(10);
+				a.flush();
+				let second;
+				try { await h.createSyncAccessHandle(); second = "opened"; } catch (e) { second = e.name; }
+				let writable;
+				try { await h.createWritable(); writable = "opened"; } catch (e) { writable = e.name; }
+				const size2 = a.getSize();
+				a.close();
+				postMessage({ size1, size2, second, writable });
+			};`;
+		const worker = new Worker(URL.createObjectURL(new Blob([src], { type: "text/javascript" })));
+		const result = await new Promise((resolve, reject) => {
+			worker.onmessage = (e) => resolve(e.data);
+			worker.onerror = (e) => reject(new Error(e.message));
+			worker.postMessage(0);
+		});
+		worker.terminate();
+		return result;
+	},
+
+	// J. Characterize pako on a cut vs corrupted member (torn-tail detection).
+	async pakoTornProbe() {
+		const out = {};
+		const full = await gzip("<c>" + "q".repeat(3000) + "</c>\n");
+		const { Inflate: InflateP } = await import("/node_modules/pako/dist/pako.mjs");
+		// raw deflate starts after the 10-byte gzip header
+		const rawFull = full.subarray(10);
+		const cuts = [1, 5, Math.floor(rawFull.length / 2), rawFull.length - 10, rawFull.length];
+		for (const cut of cuts) {
+			const inf = new InflateP({ raw: true });
+			let R;
+			try { R = inf.push(rawFull.subarray(0, cut), true); } catch (e) { R = "THREW " + e.name + ":" + e.message; }
+			out["cut " + cut + "/" + rawFull.length] = { ended: inf.ended, err: inf.err, msg: inf.msg, push: typeof R === "boolean" ? (R ? "done" : "returned-false") : R };
+		}
+		const bad = new Uint8Array(rawFull); bad[rawFull.length - 100] ^= 0xff;
+		const inf2 = new InflateP({ raw: true });
+		let R2; try { R2 = inf2.push(bad, true); } catch (e) { R2 = "THREW " + e.name + ":" + e.message; }
+		out.corrupt_inside = { ended: inf2.ended, err: inf2.err, msg: inf2.msg, push: typeof R2 === "boolean" ? "done/false" : R2 };
+		return { full: full.length, raw: rawFull.length, out };
+	},
+
+	// H. Pako member walk on a file read from OPFS, with a cut-off tail.
+	async pakoRecovery() {
+		const { readMembers } = window.__members;
+		const h = await (await dir()).getFileHandle("pako.html.gz", { create: true });
+		const a = await gzip("<h>header</h>\n");
+		const b = await gzip("<c>one</c>\n");
+		const w = await h.createWritable();
+		await w.write(a); await w.write(b); await w.close();
+		const full = await fileBytes("pako.html.gz");
+		const r = await readPakoMembers(full, pako_inflate_raw);
+		let cutsRecovered = 0, wrong = 0;
+		for (let cut = a.length + 1; cut < full.length; cut++) {
+			const rr = await readPakoMembers(full.subarray(0, cut), pako_inflate_raw);
+			if (rr.valid_bytes === a.length && rr.text === "<h>header</h>\n") cutsRecovered++;
+			else wrong++;
+		}
+		return { whole: r.text, valid: r.valid_bytes, cutsRecovered, wrong, full: full.length };
+	},
+
+	// I. Torn sync-handle write: half a member written in place, then reread.
+	async tornSyncWrite() {
+		const { readMembers } = window.__members;
+		const h = await (await dir()).getFileHandle("torn-sync.html.gz", { create: true });
+		const a = await gzip("<c>kept</c>\n");
+		const full = await gzip("<c>" + "y".repeat(5000) + "</c>\n");
+		const kept = new Uint8Array(await (await h.getFile()).arrayBuffer());
+		const w = await h.createWritable(); await w.write(new Uint8Array([...kept, ...full])); await w.close();
+		const k2 = new Uint8Array(await (await h.getFile()).arrayBuffer());
+		const cut = k2.subarray(0, a.length + Math.floor(full.length / 2));
+		const a2 = await h.createWritable(); await a2.write(cut); await a2.close();
+		const r = await readPakoMembers(cut, pako_inflate_raw);
+		const w3 = await h.createWritable(); await w3.write(new Uint8Array([...kept, ...full])); await w3.close();
+		return { valid: r.valid_bytes, text: r.text.slice(0, 20), cutBytes: cut.length };
+	},
+
+	async appendSpeed() {
+		const name = "speed.html.gz";
+		await (await dir()).removeEntry(name).catch(() => {});
+		const row = `<article itemscope itemtype="/sessions/task">${"y".repeat(800)}</article>\n`;
+		const t0 = performance.now();
+		for (let i = 0; i < 200; i++) await appendWritable(name, await gzip(row));
+		const ms = performance.now() - t0;
+		return { members: 200, ms: Math.round(ms), perCommitMs: +(ms / 200).toFixed(2), size: (await fileBytes(name)).length };
+	},
+};
+
+// pako is served from node_modules by serve.mjs; the walk is the fork's members.ts.
+import { Inflate } from "/node_modules/pako/dist/pako.mjs";
+const pako_inflate_raw = (data) => {
+	const inflate = new Inflate({ raw: true });
+	let threw;
+	try { inflate.push(data, true); } catch (e) { threw = e; }
+	// Z_BUF_ERROR (-5, "buffer error") means the input ran out: an unfinished tail.
+	if (!inflate.ended || (threw ? true : inflate.err === -5)) return { status: "short" };
+	if (inflate.err) throw inflate.msg ? new Error(inflate.msg) : new Error("pako inflate failed");
+	return { status: "end", output: inflate.result, consumed: data.length - inflate.strm.avail_in };
+};
+const readPakoMembers = (bytes, inflate) => {
+	const HEADER = [31, 139, 8, 0], T = 10, TRAIL = 8;
+	const decoder = new TextDecoder("utf-8", { fatal: true });
+	const parts = []; let offset = 0;
+	// crc32 table
+	let table = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; table[n] = c >>> 0; }
+	const crc32 = (b) => { let crc = 0xffffffff; for (let i = 0; i < b.length; i++) crc = table[(crc ^ b[i]) & 0xff] ^ (crc >>> 8); return (crc ^ 0xffffffff) >>> 0; };
+	const u32 = (b, at) => (b[at] | (b[at + 1] << 8) | (b[at + 2] << 16) | (b[at + 3] << 24)) >>> 0;
+	while (offset < bytes.length) {
+		const left = bytes.length - offset;
+		for (let i = 0; i < Math.min(4, left); i++) if (bytes[offset + i] !== HEADER[i]) throw new Error(`Invalid session gzip header at byte ${offset}`);
+		if (left < T) break;
+		const res = inflate(bytes.subarray(offset + T));
+		if (res.status === "short") break;
+		const size = T + res.consumed + TRAIL; if (size > left) break;
+		const at = offset + T + res.consumed;
+		if (u32(bytes, at) !== crc32(res.output) || u32(bytes, at + 4) !== res.output.length >>> 0) throw new Error(`checksum at ${offset}`);
+		if (res.output.length === 0 || res.output[res.output.length - 1] !== 10) throw new Error(`newline at ${offset}`);
+		parts.push(decoder.decode(res.output)); offset += size;
+	}
+	return { text: parts.join(""), valid_bytes: offset, incomplete_bytes: bytes.length - offset };
+};
+window.__members = { readMembers: readPakoMembers };
+window.checks = checks;
+window.run = async (name) => {
+	try {
+		return JSON.stringify(await checks[name]());
+	} catch (e) {
+		return JSON.stringify({ error: `${e.name}: ${e.message}` });
+	}
+};
+document.getElementById("out").textContent = "ready";
+</script>
+</body>
+</html>
