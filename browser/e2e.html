@@ -1,0 +1,29 @@
+<!doctype html><meta charset="utf-8"><title>e2e</title><output id=o>
+<script type="module">
+  const out = (x) => { document.getElementById("o").textContent += JSON.stringify(x) + "\n" };
+  const ctx = { kind: "background" };
+  const m = await import("/pi-durable.browser.js");
+  const S = m.BrowserHtmlStorage;
+  const name = "e2e-store";
+  // clean
+  try { await navigator.storage.getDirectory().then(d => d.removeEntry(name)).catch(() => {}); } catch {}
+  try { await navigator.storage.getDirectory().then(d => d.removeEntry(name)); } catch {}
+  // 1. open + write two commits
+  const a = await S.open(name, "e2e", "+16282281824");
+  await a.commit([{ type: "conversation", value: { id: 1 } }], ctx);
+  await a.commit([{ type: "entry", value: { id: 2, conversationId: 1, kind: "pi.user", model: [{ role: "user", content: "hello e2e", timestamp: 1 }] } }], ctx);
+  const e1 = await a.entry(2, ctx);
+  await a.close(ctx);
+  // 2. reopen (replay) and read
+  const b = await S.open(name, "e2e", "+16282281824");
+  const e2 = await b.entry(2, ctx);
+  const conv = await b.conversation(1, ctx);
+  await b.close(ctx);
+  out({ write: e1?.entry?.model?.[0]?.content, replay: e2?.entry?.model?.[0]?.content, conv: !!conv });
+  // 3. exclusivity: two writers cannot both hold the handle
+  const c = await S.open(name, "e2e", "+16282281824");
+  let second = "opened";
+  try { await S.open(name, "e2e", "+16282281824"); } catch (err) { second = err.name + ":" + err.message; }
+  await c.close(ctx);
+  out({ secondWriter: second });
+</script>
