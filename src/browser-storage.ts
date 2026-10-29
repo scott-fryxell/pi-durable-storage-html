@@ -13,6 +13,7 @@ import {
 	type RawInflate,
 } from "@earendil-works/pi-coding-agent/session-rows";
 import { Inflate } from "pako";
+import { WRITER_WORKER_SOURCE } from "./browser-writer.ts";
 import { decodeLog, encodeCommit } from "./rows.ts";
 
 const pako_inflate_raw: RawInflate = (data) => {
@@ -44,7 +45,8 @@ export class BrowserHtmlStorage implements Storage {
 		readonly session: string,
 		readonly owner: string | undefined,
 	) {
-		this.worker = new Worker(new URL("./writer-worker.ts", import.meta.url), { type: "module" });
+		const source = new Blob([WRITER_WORKER_SOURCE], { type: "text/javascript" });
+		this.worker = new Worker(URL.createObjectURL(source), { type: "module" });
 		this.worker.onmessage = (e) => {
 			const p = this.pending.get(e.data.id);
 			if (p) {
