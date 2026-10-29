@@ -67,15 +67,16 @@ export class BrowserHtmlStorage implements Storage {
 	/** Open or truncate-recover the OPFS store, then replay committed members. */
 	static async open(name: string, session: string, owner?: string): Promise<BrowserHtmlStorage> {
 		const storage = new BrowserHtmlStorage(name, session, owner);
-		await navigator.locks.request(`${name}:writer`, { ifAvailable: true }, (lock) => lock).then((lock) => {
-			if (!lock) throw new Error(`${name} is held by another tab`);
-		});
 		let opened: { size: number; bytes: Uint8Array } | undefined;
 		try {
-			opened = (await storage.call({ kind: "open", name })) as { size: number; bytes: Uint8Array };
-		} catch {
-			opened = undefined;
+			const res = (await storage.call({ kind: "open", name })) as { size: number; bytes: Uint8Array; error?: string };
+		if (res.error) {
+			// A second holder means another tab writes; hand Explorer its TakenError shape.
+			const err = new Error(res.error) as Error & { name: string };
+			err.name = "OwnershipLostError";
+			throw err;
 		}
+		opened = res;
 		if (opened && opened.error) throw new Error(opened.error);
 		const bytes = opened?.bytes ?? new Uint8Array();
 		// A torn tail is dropped from memory; the worker still holds the file bytes for appends.
@@ -101,12 +102,36 @@ export class BrowserHtmlStorage implements Storage {
 		return storage;
 	}
 
+	/** Read the store without the writer's sync handle; commits are refused. */
+	static async readOnly(name: string, session: string, owner?: string): Promise<BrowserHtmlStorage> {
+		const storage = new BrowserHtmlStorage(name, session, owner);
+		const root = await navigator.storage.getDirectory();
+		let bytes = new Uint8Array();
+		try {
+			const file = await root.getFileHandle(name);
+			bytes = new Uint8Array(await (await file.getFile()).arrayBuffer());
+		} catch {
+			bytes = new Uint8Array();
+		}
+		const read = readMembers(bytes, pako_inflate_raw);
+		if (read.incomplete_bytes > 0 && read.valid_bytes > 0) bytes = bytes.subarray(0, read.valid_bytes);
+		const { commits, complete } = decodeLog(read.text);
+		if (read.text.length > 0 && !complete) throw new Error(`${name}: a commit has fewer rows than it promises`);
+		if (read.text.length > 0)
+			for (const { seq, writes } of commits) {
+				storage.memory.prepareCommit(writes, seq).apply();
+				for (const w of writes) storage.track(w);
+			}
+		return storage;
+	}
+
 	private async rewrite(bytes: Uint8Array) {
 		await this.call({ kind: "truncate", length: bytes.length });
 		if (bytes.length > 0) await this.call({ kind: "append", bytes });
 	}
 
 	async commit(writes: readonly StorageWrite[], _context: Context): Promise<Seq> {
+		if (this.closed) throw new Error("read-only explorer tab cannot write");
 		const prepared = this.memory.prepareCommit(writes);
 		const lineage = (write: StorageWrite) => this.lineage(write);
 		const text = encodeCommit(prepared.seq, prepared.writes, this.session, this.owner, lineage);
